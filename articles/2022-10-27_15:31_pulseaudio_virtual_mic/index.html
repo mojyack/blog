@@ -1,0 +1,18 @@
+<!DOCTYPE html><html lang="jp"><title>PulseAudioで仮想マイクを作る</title><head><meta content="text/html;charset=utf-8" http-equiv="Content-Type"><link rel="stylesheet" href="/blog/assets/style.css"><link rel="stylesheet" href="/blog/assets/article.css"></head><header><div class="title"><h1>dn1(mojyack's blog)</h1><h2>猫と仲良く暮らしたいだけの男、プログラマの成り損ない。</h2></div><nav class="main_menu"><a href="/blog/">Home</a><a href="/blog/categories/index.html">Categories</a><a href="/blog/about.html">About</a></nav></header><div id="article_header"><h1 id="article_title">PulseAudioで仮想マイクを作る</h1><div id="article_date">2022-10-27</div><ul id="tag_list"><li><a href="/blog/categories/PulseAudio.html">PulseAudio</a></li><li><a href="/blog/categories/Linux.html">Linux</a></li></ul></div><h1>PulseAudioで仮想マイクを作る</h1>
+<h2>仮想スピーカーを作る</h2>
+<p>仮想スピーカーを作れば勝手にそれのモニターソースが作られるので、それを利用する。</p>
+<pre><code>pactl load-module module-null-sink sink_name=Virtual-Speaker sink_properties=device.description=Virtual-Speaker
+</code></pre>
+<h2>動作確認</h2>
+<p>適当なオーディオファイルを用意<br />
+ターミナルを2つ開き、1つ目で以下を実行</p>
+<pre><code>parec --file-format=wav --device=Virtual-Speaker.monitor /path/to/saved-audio.wav
+</code></pre>
+<p>もう片方で以下を実行</p>
+<pre><code>paplay --device=Virtual-Speaker /path/to/sample-audio.wav
+</code></pre>
+<p>しばらく待って、saved-audio.wavにsample-audio.wavの内容が録音されていたら成功</p>
+<h2>後片付け</h2>
+<p>不要になったら以下の方法で削除できる
+<code>pactl list short modules</code>でモジュール一覧を表示、<code>module-null-sink</code>の行の先頭にモジュール番号が記載されているので、以下のコマンドで削除
+<code>pactl unload-module $MOD_NUM</code></p></html>
