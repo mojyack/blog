@@ -1,0 +1,835 @@
+<!DOCTYPE html><html lang="jp"><title>C++のポリモーフィズムとそのパフォーマンス</title><head><meta content="text/html;charset=utf-8" http-equiv="Content-Type"><link rel="stylesheet" href="/blog/assets/style.css"><link rel="stylesheet" href="/blog/assets/article.css"></head><header><div class="title"><h1>dn1(mojyack's blog)</h1><h2>猫と仲良く暮らしたいだけの男、プログラマの成り損ない。</h2></div><nav class="main_menu"><a href="/blog/">Home</a><a href="/blog/categories/index.html">Categories</a><a href="/blog/about.html">About</a></nav></header><div id="article_header"><h1 id="article_title">C++のポリモーフィズムとそのパフォーマンス</h1><div id="article_date">2022-11-25</div><ul id="tag_list"><li><a href="/blog/categories/C++.html">C++</a></li></ul></div><h1>C++のポリモーフィズムとそのパフォーマンス</h1>
+<h2>モチベーション</h2>
+<p>この記事は、C++の仮想関数が実は遅いのではないか、もっと早い方法があるのではないかという思いつきから、それの検証結果をまとめたものである。<br />
+私はC++が好きだが、その専門家ではないため、もし記事の内容に誤りがあれば<a href="https://github.com/mojyack/blog-source">Githubリポジトリ</a>やTwitterなどから教えてほしい。</p>
+<h2>動的/静的 ポリモーフィズム</h2>
+<p>C++では、仮想関数で動的ポリモーフィズムを実装できる。</p>
+<pre><code class="language-C++">#include &lt;iostream&gt;
+
+class Animal {
+  public:
+    virtual auto speak() -&gt; void = 0;
+};
+
+class Cat : public Animal {
+  public:
+    auto speak() -&gt; void override {
+        std::cout &lt;&lt; &quot;meow\n&quot;;
+    }
+};
+
+class Dog : public Animal {
+  public:
+    auto speak() -&gt; void override {
+        std::cout &lt;&lt; &quot;bowwow\n&quot;;
+    }
+};
+
+auto speak_virtual(Animal* animal) -&gt; void {
+    // (4) 'animal'の構築方法によってCat::speakとDog::speakとが呼び分けられる
+    animal-&gt;speak();
+}
+
+auto park_virtual() {
+    auto cat = Cat(); // (1) 'cat' は 'Cat'型
+    auto dog = Dog(); // (2) 'dog' は 'Dog'型
+    speak_virtual(&amp;cat);  // (3) でも両方 'Animal*' を取り出せる
+    speak_virtual(&amp;dog);
+}
+</code></pre>
+<p>だが、仮想関数はインライン化による最適化を妨げる。パフォーマンスを上げるなら、できるだけ関数ポインタの使用は避けるべきだ。<br />
+上の例の場合、テンプレートを用いると、同じことが静的ポリモーフィズムで実現できる。</p>
+<pre><code class="language-C++">#include &lt;concepts&gt;
+#include &lt;iostream&gt;
+
+// コンセプト 'Animal' の要件を定義する
+template &lt;class T&gt;
+concept Animal = requires(T&amp; t) {
+// 'Animal' は 'speak' というvoidを返す関数を持たなければならない
+    { t.speak() } -&gt; std::same_as&lt;void&gt;;
+};
+
+class Cat {
+  public:
+    auto speak() -&gt; void {
+        std::cout &lt;&lt; &quot;meow\n&quot;;
+    }
+};
+
+class Dog {
+  public:
+    auto speak() -&gt; void {
+        std::cout &lt;&lt; &quot;bowwow\n&quot;;
+    }
+};
+
+// コンセプト 'Animal' を満たす何らかの型を受け付ける
+template &lt;Animal T&gt;
+auto speak_template(T&amp; animal) {
+    animal.speak();
+}
+
+auto park_template() {
+    auto cat = Cat();
+    auto dog = Dog();
+    speak_template(cat); // 'Cat' は 'Animal' を満たす
+    speak_template(dog); // 'Dog' は 'Animal' を満たす
+}
+</code></pre>
+<p>こうすれば、{Cat, Dog}::speakはインライン化が可能で、パフォーマンスの向上が期待できる。</p>
+<h2>同一の型に代入する</h2>
+<p>だが、これだけでは仮想関数を置き換えたとは言えない。以下のように、Cat/Dogのインスタンスを一つのvectorに保存する例を考える。</p>
+<pre><code class="language-C++">auto speak_virtual2(std::vector&lt;Animal*&gt; animals) -&gt; void {
+    for(auto animal : animals) {
+        animal-&gt;speak();
+    }
+}
+
+auto park_virtual2() {
+    auto animals = std::vector&lt;Animal*&gt;{new Cat, new Dog};
+    speak_virtual2(animals);
+}
+</code></pre>
+<p>テンプレートを使うと以下のように書きたくなるが、このコードはコンパイルできない。</p>
+<pre><code class="language-C++">auto speak_template2(std::vector&lt;Animal&gt;&amp; animal) {
+    for(auto animal: animals) {
+        animal.speak();
+    }
+}
+
+auto park_template2() {
+    auto animals = std::vector&lt;Animal&gt;{Cat(), Dog()};
+}
+</code></pre>
+<p><code>std::vector&lt;Animal&gt;</code>というのはできない。<code>Animal</code>はあくまでコンセプト(型が満たすべき要件の名前)であり、具体的な型ではないからである。  </p>
+<h2>std::variantを使う</h2>
+<p>そこで、<code>std::variant</code>を使う。<code>std::variant</code>は<code>union</code>の強化版みたいなやつである(<a href="https://cpprefjp.github.io/reference/variant.html">cpprefjp</a>を読んでほしい)。<br />
+すると、上のコードはこのようになる。</p>
+<pre><code class="language-C++">using SomeAnimal = std::variant&lt;Cat, Dog&gt;;
+
+auto speak_template2(std::vector&lt;SomeAnimal&gt;&amp; animals) {
+    for(auto animal : animals) {
+        if(animal.index() == 0) {
+            // 'animal' には 'Cat' のインスタンスが入っている
+            std::get&lt;0&gt;(animal).speak();
+        } else if(animal.index() == 1) {
+            // 'animal' には 'Dog' のインスタンスが入っている
+            std::get&lt;1&gt;(animal).speak();
+        }
+    }
+}
+
+auto park_template2() {
+    auto animals = std::vector&lt;SomeAnimal&gt;{Cat(), Dog()};
+    speak_template2(animals);
+}
+</code></pre>
+<p>これで仮想関数と同じことができるようになった。</p>
+<p>だが待ってほしい、<code>speak_virtual2</code>と<code>speak_template2</code>を見比べてみると、<code>speak_template2</code>には拡張性がないことがわかる。動物の種類が増えた場合、<code>speak_virtual2</code>はそのまま動くが、<code>speak_template2</code>は<code>else if</code>節を増やさなければならない。これはちょっといただけない。この問題の解決策の一つは、std::visitである。</p>
+<h2>std::visitを使う</h2>
+<p>詳しいことは例によって<a href="https://cpprefjp.github.io/reference/variant/visit.html">cpprefjp</a>を見てもらうとして、<code>std::visit</code>を使うと<code>speak_template2</code>は以下のように書き直せる。</p>
+<pre><code class="language-C++">auto speak_template2(std::vector&lt;SomeAnimal&gt;&amp; animals) {
+    for(auto animal : animals) {
+        std::visit([](auto animal) { animal.speak(); }, animal);
+    }
+}
+</code></pre>
+<p>これで<code>speak_template2</code>を書き直さなくても良くなった、めでたしめでたし...
+と言いたいが、この方法には問題がある。それは、std::visitが遅いということだ。<br />
+将来は変わるかもしれないが、現時点(clang 15.0.3)の実装では、std::visitは内部で関数ポインタのリストを作る。これでは、仮想関数のときと何も変わらない。後述するベンチマークでも、std::visitは仮想関数と同じくらいのパフォーマンスしか出ないことがわかっている。よって、別の方法を考えなければならない。</p>
+<h2>std::visitを使わない</h2>
+<p>別の方法として私が用意したのは、この関数である。</p>
+<pre><code class="language-C++">template &lt;class V, size_t index = 0&gt;
+auto visit(V&amp; variant, auto visitor) -&gt; auto{
+    if constexpr(index &lt; std::variant_size_v&lt;V&gt;) {
+        if(index == variant.index()) {
+            return visitor(std::get&lt;index&gt;(variant));
+        }
+        return visit&lt;V, index + 1&gt;(variant, visitor);
+    }
+
+    // unreachable
+    return decltype(visitor(std::get&lt;0&gt;(variant)))();
+}
+</code></pre>
+<p>愚直にif-elseをネストしていくものだ。私はコンパイラがこの再帰関数を<code>switch</code>文のような形に最適化してくれることを期待してこの関数を書いた。実際にコンパイラはこれを最適化できるのか、ベンチマークを行った。</p>
+<h2>ベンチマーク</h2>
+<p>ベンチマークは、以下のプログラムで行った: <a href="https://gist.github.com/mojyack/cb9980edd1c643bbe9f3aadccc025593">gist</a><br />
+このプログラムは、<code>bench.sh</code>を実行すると、計測を行い、結果をcsvで出力する。<br />
+計測環境は以下のとおり:</p>
+<pre><code>&gt; uname -srmpio
+Linux 6.0.8-gentoo x86_64 Intel(R) Core(TM) i5-6300U CPU @ 2.40GHz GenuineIntel GNU/Linux
+&gt; clang++ --version
+clang version 15.0.3
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+...
+&gt; g++ --version
+g++ (Gentoo 11.3.0 p4) 11.3.0
+...
+</code></pre>
+<p>結果は以下のようになった。なお、自作visit/std::visit/仮想関数の値は計算にかかった時間[ms]であり、この値が小さいほどスコアが高い。</p>
+<table>
+<thead>
+<tr>
+<th>コンパイラ</th>
+<th>コンパイルフラグ</th>
+<th>クラス数</th>
+<th>自作visit</th>
+<th>std::visit</th>
+<th>仮想関数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>10</td>
+<td>97.033</td>
+<td>234.817</td>
+<td>221.076</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>20</td>
+<td>141.387</td>
+<td>490.131</td>
+<td>413.372</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>30</td>
+<td>203.286</td>
+<td>723.042</td>
+<td>607.475</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>40</td>
+<td>255.035</td>
+<td>861.751</td>
+<td>856.832</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>50</td>
+<td>305.896</td>
+<td>1257.91</td>
+<td>991.581</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>60</td>
+<td>382.367</td>
+<td>1385.04</td>
+<td>1194.56</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>70</td>
+<td>450.464</td>
+<td>1481.31</td>
+<td>1600.22</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>80</td>
+<td>492.322</td>
+<td>2086.06</td>
+<td>1564.57</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>90</td>
+<td>533.243</td>
+<td>2047.01</td>
+<td>1911.61</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2</td>
+<td>100</td>
+<td>618.091</td>
+<td>2130.54</td>
+<td>2274.01</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>10</td>
+<td>87.757</td>
+<td>253.382</td>
+<td>219.609</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>20</td>
+<td>166.153</td>
+<td>444.994</td>
+<td>445.919</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>30</td>
+<td>236.934</td>
+<td>652.188</td>
+<td>651.866</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>40</td>
+<td>281.385</td>
+<td>858.436</td>
+<td>796.791</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>50</td>
+<td>337.698</td>
+<td>1072.3</td>
+<td>1063.68</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>60</td>
+<td>424.743</td>
+<td>1269.64</td>
+<td>1472.21</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>70</td>
+<td>451.75</td>
+<td>1989.17</td>
+<td>1378.57</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>80</td>
+<td>513.329</td>
+<td>1842.56</td>
+<td>1921.86</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>90</td>
+<td>575.712</td>
+<td>2062.67</td>
+<td>1770.23</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O2 -march=native</td>
+<td>100</td>
+<td>626.588</td>
+<td>2103.54</td>
+<td>1968.92</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>10</td>
+<td>94.529</td>
+<td>216.833</td>
+<td>216.673</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>20</td>
+<td>157.228</td>
+<td>444.92</td>
+<td>403.178</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>30</td>
+<td>224.791</td>
+<td>655.307</td>
+<td>592.329</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>40</td>
+<td>264.172</td>
+<td>922.451</td>
+<td>859.69</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>50</td>
+<td>352.95</td>
+<td>1156.16</td>
+<td>1114.9</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>60</td>
+<td>433.706</td>
+<td>1276.92</td>
+<td>1170.57</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>70</td>
+<td>456.251</td>
+<td>1602.15</td>
+<td>1464.3</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>80</td>
+<td>535.051</td>
+<td>1702</td>
+<td>1557.87</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>90</td>
+<td>633.928</td>
+<td>1738.01</td>
+<td>2148.94</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3</td>
+<td>100</td>
+<td>672.476</td>
+<td>1950.06</td>
+<td>2212.1</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>10</td>
+<td>85.519</td>
+<td>215.345</td>
+<td>212.717</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>20</td>
+<td>161.783</td>
+<td>400.061</td>
+<td>409.75</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>30</td>
+<td>231.689</td>
+<td>590.054</td>
+<td>600.353</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>40</td>
+<td>262.328</td>
+<td>859.299</td>
+<td>785.118</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>50</td>
+<td>366.56</td>
+<td>982.333</td>
+<td>1205.75</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>60</td>
+<td>401.049</td>
+<td>1269.82</td>
+<td>1173.84</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>70</td>
+<td>443.28</td>
+<td>1377.44</td>
+<td>1374.58</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>80</td>
+<td>518.75</td>
+<td>1611.39</td>
+<td>1611.92</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>90</td>
+<td>582.389</td>
+<td>1752.67</td>
+<td>1748.15</td>
+</tr>
+<tr>
+<td>clang++</td>
+<td>-O3 -march=native</td>
+<td>100</td>
+<td>626.982</td>
+<td>2460.16</td>
+<td>2706.08</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>10</td>
+<td>248.107</td>
+<td>209.287</td>
+<td>216.098</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>20</td>
+<td>620.707</td>
+<td>400.464</td>
+<td>404.299</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>30</td>
+<td>1292.34</td>
+<td>592.015</td>
+<td>596.079</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>40</td>
+<td>1970.54</td>
+<td>780.023</td>
+<td>787.015</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>50</td>
+<td>3716.85</td>
+<td>968.304</td>
+<td>1060.89</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>60</td>
+<td>4271.83</td>
+<td>1160.52</td>
+<td>1489.96</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>70</td>
+<td>5432.89</td>
+<td>1354.62</td>
+<td>1352.89</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>80</td>
+<td>6969.79</td>
+<td>1544.44</td>
+<td>1555.04</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>90</td>
+<td>9008.94</td>
+<td>1735.4</td>
+<td>1752.58</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2</td>
+<td>100</td>
+<td>11373</td>
+<td>1931.97</td>
+<td>2022.51</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>10</td>
+<td>252.933</td>
+<td>214.043</td>
+<td>207.293</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>20</td>
+<td>637.273</td>
+<td>398.34</td>
+<td>440.471</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>30</td>
+<td>1121.94</td>
+<td>598.113</td>
+<td>591.298</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>40</td>
+<td>2037.67</td>
+<td>779.267</td>
+<td>782.824</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>50</td>
+<td>3727.58</td>
+<td>974.498</td>
+<td>971.101</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>60</td>
+<td>4385.45</td>
+<td>1163.93</td>
+<td>1536.86</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>70</td>
+<td>5544.48</td>
+<td>1366.66</td>
+<td>1357.61</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>80</td>
+<td>7374.18</td>
+<td>1545.79</td>
+<td>1682.08</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>90</td>
+<td>9138.98</td>
+<td>1720.69</td>
+<td>1752.4</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O2 -march=native</td>
+<td>100</td>
+<td>11339.1</td>
+<td>1929.87</td>
+<td>2032.89</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>10</td>
+<td>204.035</td>
+<td>206.24</td>
+<td>214.124</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>20</td>
+<td>633.946</td>
+<td>397.05</td>
+<td>400.914</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>30</td>
+<td>1218.96</td>
+<td>590.651</td>
+<td>586.704</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>40</td>
+<td>1988.95</td>
+<td>777.166</td>
+<td>783.557</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>50</td>
+<td>3124.02</td>
+<td>1140.46</td>
+<td>978.282</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>60</td>
+<td>4229.49</td>
+<td>1365.2</td>
+<td>1620.03</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>70</td>
+<td>5632.49</td>
+<td>1594.41</td>
+<td>1353.67</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>80</td>
+<td>6945.6</td>
+<td>1811.83</td>
+<td>1553.93</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>90</td>
+<td>8822.34</td>
+<td>2190.55</td>
+<td>1753.45</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3</td>
+<td>100</td>
+<td>11114.5</td>
+<td>2799.2</td>
+<td>1940.48</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>10</td>
+<td>202.966</td>
+<td>206.025</td>
+<td>215.983</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>20</td>
+<td>634.863</td>
+<td>401.419</td>
+<td>400.082</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>30</td>
+<td>1212.29</td>
+<td>592.703</td>
+<td>589.978</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>40</td>
+<td>1983.95</td>
+<td>776.102</td>
+<td>782.775</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>50</td>
+<td>3125.77</td>
+<td>1136.91</td>
+<td>977.305</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>60</td>
+<td>4264.52</td>
+<td>1364.53</td>
+<td>1362.77</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>70</td>
+<td>5626.41</td>
+<td>1591.53</td>
+<td>1355.24</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>80</td>
+<td>6902.98</td>
+<td>1808.91</td>
+<td>1549.3</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>90</td>
+<td>8832.96</td>
+<td>2185.94</td>
+<td>1744.19</td>
+</tr>
+<tr>
+<td>g++</td>
+<td>-O3 -march=native</td>
+<td>100</td>
+<td>11092.5</td>
+<td>2785.16</td>
+<td>1937.83</td>
+</tr>
+</tbody>
+</table>
+<p>この表から<code>clang++ -O2</code>と<code>g++ -O2</code>の行をそれぞれ抜き出してプロットすると、以下のグラフのようになった。
+<img alt="result-1" src="data/result-1.png" />グラフ中のrecursive-ifとは自作visit関数のことである。<br />
+さて、際立っているのは、clangのrecursive-ifとgccのrecursive-ifである。前者は圧倒的に早いが、後者は圧倒的に遅い。<br />
+前者が早いことから、clangは自作visitを想定どおりに最適化していると予想される。<br />
+一方、後者については、その計算時間がクラス数に対してべき級数的に増加していることから、gccは自作visitをそのまま再帰関数としてコンパイルしたことが予想される。<br />
+これらの傾向は-O3フラグをつけても変わらないため、clangはこの関数を最適化できるが、gccはできない、という結論になった。<br />
+その他の方法、std::visitや仮想関数については、どれも似たような値が出ている。それを確かめるため、縦軸の最大値を2500に固定したグラフも用意した。
+<img alt="result-2" src="data/result-2.png" />若干gccのstd::visitが早い気もするが、どれも同じようなものと言っていいだろう。</p>
+<h2>まとめ</h2>
+<p>最適化が効くコンパイラを使うなら、自作visitの方法を使うのが最も早いことがわかった。逆に、そのようなコンパイラを使えないなら、仮想関数から乗り換えてもあまり効果はなさそうである。</p></html>
